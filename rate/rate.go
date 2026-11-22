@@ -54,6 +54,10 @@ func Every(interval time.Duration) Limit {
 // The methods AllowN, ReserveN, and WaitN consume n tokens.
 //
 // Limiter is safe for simultaneous use by multiple goroutines.
+//
+// A Reservation returned by ReserveN can be revoked before the reserved
+// action happens. Revoke and RevokeAt report why a revocation did or did
+// not return tokens; see RevocationStatus.
 type Limiter struct {
 	mu     sync.Mutex
 	limit  Limit
@@ -63,6 +67,11 @@ type Limiter struct {
 	last time.Time
 	// lastEvent is the latest time of a rate-limited event (past or future)
 	lastEvent time.Time
+	// generation identifies the current configuration of the bucket. It is
+	// captured by each Reservation and advanced by SetLimitAt and SetBurstAt
+	// so that a reservation made against an old configuration cannot revoke
+	// tokens from the current one.
+	generation uint64
 }
 
 // Limit returns the maximum overall event rate.
@@ -82,6 +91,16 @@ func (lim *Limiter) Burst() int {
 	return lim.burst
 }
 
+// Generation returns the limiter's current configuration generation.
+// It advances whenever SetLimitAt or SetBurstAt is called. A Reservation
+// captures the generation that was current when it was created; see
+// Reservation.Generation.
+func (lim *Limiter) Generation() uint64 {
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
+	return lim.generation
+}
+
 // TokensAt returns the number of tokens available at time t.
 func (lim *Limiter) TokensAt(t time.Time) float64 {
 	lim.mu.Lock()
@@ -99,9 +118,10 @@ func (lim *Limiter) Tokens() float64 {
 // bursts of at most b tokens.
 func NewLimiter(r Limit, b int) *Limiter {
 	return &Limiter{
-		limit:  r,
-		burst:  b,
-		tokens: float64(b),
+		limit:      r,
+		burst:      b,
+		tokens:     float64(b),
+		generation: 1,
 	}
 }
 
@@ -119,6 +139,11 @@ func (lim *Limiter) AllowN(t time.Time, n int) bool {
 
 // A Reservation holds information about events that are permitted by a Limiter to happen after a delay.
 // A Reservation may be canceled, which may enable the Limiter to permit additional events.
+//
+// A Reservation remembers the number of tokens it reserved and the limiter
+// generation in effect when it was created. Revocation returns only the tokens
+// that have neither matured nor been claimed by later reservations, and reports
+// the outcome as a Revocation.
 type Reservation struct {
 	ok        bool
 	lim       *Limiter
@@ -126,6 +151,12 @@ type Reservation struct {
 	timeToAct time.Time
 	// This is the Limit at reservation time, it can change later.
 	limit Limit
+	// generation is the Limiter generation at reservation time. Canceling a
+	// reservation from an older generation must not modify the current bucket.
+	generation uint64
+	// revoked records that the reservation has reached a terminal state.
+	// It is guarded by lim.mu.
+	revoked bool
 }
 
 // OK returns whether the limiter can provide the requested number of tokens
@@ -133,6 +164,18 @@ type Reservation struct {
 // Cancel does nothing.
 func (r *Reservation) OK() bool {
 	return r.ok
+}
+
+// Generation returns the limiter generation that was current when the
+// reservation was created.
+func (r *Reservation) Generation() uint64 {
+	return r.generation
+}
+
+// Tokens returns the number of tokens held by the reservation. It returns
+// zero if the reservation was not granted.
+func (r *Reservation) Tokens() int {
+	return r.tokens
 }
 
 // Delay is shorthand for DelayFrom(time.Now()).
@@ -163,44 +206,185 @@ func (r *Reservation) Cancel() {
 	r.CancelAt(time.Now())
 }
 
-// CancelAt indicates that the reservation holder will not perform the reserved action
-// and reverses the effects of this Reservation on the rate limit as much as possible,
-// considering that other reservations may have already been made.
+// CancelAt indicates that the reservation holder will not perform the reserved
+// action and reverses the effects of this Reservation on the rate limit as much
+// as possible, considering that other reservations may have already been made.
+//
+// CancelAt is shorthand for RevokeAt, discarding the result. It is idempotent
+// and generation-aware: a reservation created before SetLimitAt or SetBurstAt
+// no longer matches the limiter's generation, so canceling it leaves the
+// current bucket untouched. Call RevokeAt directly when the caller needs to
+// know why a cancellation returned no tokens.
 func (r *Reservation) CancelAt(t time.Time) {
-	if !r.ok {
-		return
+	r.RevokeAt(t)
+}
+
+// RevocationStatus describes the outcome of a call to Revoke or RevokeAt.
+type RevocationStatus int
+
+const (
+	// RevocationInvalid means the reservation was never granted (OK reports
+	// false), so there was nothing to revoke.
+	RevocationInvalid RevocationStatus = iota
+	// RevocationStale means the reservation belongs to an older limiter
+	// generation. The current bucket is left untouched.
+	RevocationStale
+	// RevocationExpired means the reserved action time has already passed at
+	// the revocation time. No tokens are returned.
+	RevocationExpired
+	// RevocationConsumed means the reserved tokens were already claimed by a
+	// later reservation (or by the passage of time combined with later
+	// reservations), so no more tokens are available to return.
+	RevocationConsumed
+	// RevocationPartial means some, but not all, of the reserved tokens were
+	// returned to the bucket because later reservations had already claimed
+	// the rest.
+	RevocationPartial
+	// RevocationFull means all reserved tokens were returned to the bucket.
+	RevocationFull
+	// RevocationRepeated means this reservation was already revoked. The
+	// repeated call has no effect on the bucket.
+	RevocationRepeated
+)
+
+// String returns a human-readable name for the status.
+func (s RevocationStatus) String() string {
+	switch s {
+	case RevocationInvalid:
+		return "invalid"
+	case RevocationStale:
+		return "stale generation"
+	case RevocationExpired:
+		return "expired"
+	case RevocationConsumed:
+		return "already consumed"
+	case RevocationPartial:
+		return "partially revoked"
+	case RevocationFull:
+		return "revoked"
+	case RevocationRepeated:
+		return "already revoked"
+	default:
+		return fmt.Sprintf("RevocationStatus(%d)", int(s))
+	}
+}
+
+// A Revocation reports the result of revoking a Reservation.
+type Revocation struct {
+	// Status is the terminal state of the revocation attempt.
+	Status RevocationStatus
+	// Returned is the number of tokens the limiter actually gained. It can be
+	// smaller than the number held by the reservation when later reservations
+	// already claimed part of them, or when the bucket was already at its
+	// burst limit. It is truncated when the exact refund is fractional.
+	Returned int
+}
+
+// Revoked reports whether the reservation reached a terminal state that leaves
+// it unusable: it was revoked, had expired, or its tokens were consumed.
+func (v Revocation) Revoked() bool {
+	switch v.Status {
+	case RevocationPartial, RevocationFull, RevocationRepeated:
+		return true
+	case RevocationExpired, RevocationConsumed:
+		return true
+	default:
+		return false
+	}
+}
+
+// Revoke is shorthand for RevokeAt(time.Now()).
+func (r *Reservation) Revoke() Revocation {
+	return r.RevokeAt(time.Now())
+}
+
+// RevokeAt indicates that the reservation holder will not perform the reserved
+// action and returns any tokens that are still unused to the limiter.
+//
+// Only tokens that have neither matured nor been claimed by later reservations
+// are returned; a revocation itself never creates extra tokens, and the bucket
+// is never credited beyond the reservation's original size. RevokeAt is
+// idempotent: a second call on the same Reservation reports RevocationRepeated
+// and does not change the bucket.
+//
+// A reservation created against an older limiter generation reports
+// RevocationStale without modifying the current bucket. A reservation whose
+// action time has passed reports RevocationExpired; one whose tokens have been
+// claimed by later reservations reports RevocationConsumed. Once revoked, a
+// reservation stays terminal even if RevokeAt is called again at an earlier
+// time.
+//
+// RevokeAt is safe to call concurrently with other Limiter methods.
+func (r *Reservation) RevokeAt(t time.Time) Revocation {
+	if !r.ok || r.lim == nil {
+		return Revocation{Status: RevocationInvalid}
 	}
 
-	r.lim.mu.Lock()
-	defer r.lim.mu.Unlock()
+	lim := r.lim
+	lim.mu.Lock()
+	defer lim.mu.Unlock()
 
-	if r.lim.limit == Inf || r.tokens == 0 || r.timeToAct.Before(t) {
-		return
+	if r.revoked {
+		return Revocation{Status: RevocationRepeated}
+	}
+	if r.generation != lim.generation {
+		return Revocation{Status: RevocationStale}
+	}
+	if lim.limit == Inf || r.tokens == 0 {
+		// An infinite limiter has no bucket to refill. Treat a zero-token
+		// reservation as a successful no-op revocation so repeated calls are
+		// still reported as repeated.
+		r.revoked = true
+		return Revocation{Status: RevocationFull}
 	}
 
-	// calculate tokens to restore
-	// The duration between lim.lastEvent and r.timeToAct tells us how many tokens were reserved
-	// after r was obtained. These tokens should not be restored.
-	restoreTokens := float64(r.tokens) - r.limit.tokensFromDuration(r.lim.lastEvent.Sub(r.timeToAct))
+	// Revoking after the action time cannot give anything back: the reserved
+	// tokens were already available for use. Canceling exactly at the action
+	// time is still honored, matching the historical CancelAt behavior.
+	if r.timeToAct.Before(t) {
+		r.revoked = true
+		return Revocation{Status: RevocationExpired}
+	}
+
+	// The duration between lim.lastEvent and r.timeToAct tells us how many
+	// tokens were reserved after r was obtained. These tokens should not be
+	// restored.
+	restoreTokens := float64(r.tokens) - r.limit.tokensFromDuration(lim.lastEvent.Sub(r.timeToAct))
 	if restoreTokens <= 0 {
-		return
+		r.revoked = true
+		return Revocation{Status: RevocationConsumed}
 	}
-	// advance time to now
-	tokens := r.lim.advance(t)
-	// calculate new number of tokens
+
+	// Advance time to the revocation instant, then return the still-unused
+	// tokens. Only the refund is bounded; the bucket itself may legitimately
+	// carry a negative balance from other outstanding reservations. Record the
+	// actual change so Returned reflects what the bucket really received.
+	tokens := lim.advance(t)
+	before := tokens
 	tokens += restoreTokens
-	if burst := float64(r.lim.burst); tokens > burst {
+	if burst := float64(lim.burst); tokens > burst {
 		tokens = burst
 	}
-	// update state
-	r.lim.last = t
-	r.lim.tokens = tokens
-	if r.timeToAct.Equal(r.lim.lastEvent) {
+
+	// Update state.
+	lim.last = t
+	lim.tokens = tokens
+	if r.timeToAct.Equal(lim.lastEvent) {
 		prevEvent := r.timeToAct.Add(r.limit.durationFromTokens(float64(-r.tokens)))
 		if !prevEvent.Before(t) {
-			r.lim.lastEvent = prevEvent
+			lim.lastEvent = prevEvent
 		}
 	}
+	r.revoked = true
+
+	if restoreTokens > float64(r.tokens) {
+		restoreTokens = float64(r.tokens)
+	}
+	status := RevocationPartial
+	if restoreTokens >= float64(r.tokens) {
+		status = RevocationFull
+	}
+	return Revocation{Status: status, Returned: int(tokens - before)}
 }
 
 // Reserve is shorthand for ReserveN(time.Now(), 1).
@@ -312,6 +496,7 @@ func (lim *Limiter) SetLimitAt(t time.Time, newLimit Limit) {
 	lim.last = t
 	lim.tokens = tokens
 	lim.limit = newLimit
+	lim.generation++
 }
 
 // SetBurst is shorthand for SetBurstAt(time.Now(), newBurst).
@@ -329,6 +514,7 @@ func (lim *Limiter) SetBurstAt(t time.Time, newBurst int) {
 	lim.last = t
 	lim.tokens = tokens
 	lim.burst = newBurst
+	lim.generation++
 }
 
 // reserveN is a helper method for AllowN, ReserveN, and WaitN.
@@ -340,10 +526,11 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 
 	if lim.limit == Inf {
 		return Reservation{
-			ok:        true,
-			lim:       lim,
-			tokens:    n,
-			timeToAct: t,
+			ok:         true,
+			lim:        lim,
+			tokens:     n,
+			timeToAct:  t,
+			generation: lim.generation,
 		}
 	}
 
@@ -363,9 +550,10 @@ func (lim *Limiter) reserveN(t time.Time, n int, maxFutureReserve time.Duration)
 
 	// Prepare reservation
 	r := Reservation{
-		ok:    ok,
-		lim:   lim,
-		limit: lim.limit,
+		ok:         ok,
+		lim:        lim,
+		limit:      lim.limit,
+		generation: lim.generation,
 	}
 	if ok {
 		r.tokens = n

@@ -466,8 +466,25 @@ func TestReserveSetLimitCancel(t *testing.T) {
 	runReserve(t, lim, request{t0, 2, t0, true})
 	r := runReserve(t, lim, request{t0, 2, t4, true})
 	lim.SetLimitAt(t2, 10)
-	r.CancelAt(t2) // 2 tokens back
-	runReserve(t, lim, request{t2, 2, t3, true})
+	// SetLimitAt publishes a new generation, so the reservation made under the
+	// old one is stale: canceling it must not touch the current bucket and the
+	// next request still has to wait for the tokens it reserved.
+	r.CancelAt(t2)
+	runReserve(t, lim, request{t2, 2, t5, true})
+}
+
+func TestReserveSetLimitRevokeStale(t *testing.T) {
+	lim := NewLimiter(5, 2)
+
+	runReserve(t, lim, request{t0, 2, t0, true})
+	r := runReserve(t, lim, request{t0, 2, t4, true})
+	lim.SetLimitAt(t2, 10)
+	// RevokeAt is generation-aware: a reservation from the old generation
+	// cannot return tokens to the reconfigured bucket.
+	if got := r.RevokeAt(t2); got.Status != RevocationStale || got.Returned != 0 {
+		t.Fatalf("RevokeAt after SetLimitAt = %+v, want stale", got)
+	}
+	runReserve(t, lim, request{t2, 2, t5, true})
 }
 
 func TestReserveMax(t *testing.T) {
@@ -653,5 +670,205 @@ func TestTinyLimit(t *testing.T) {
 	// The limiter should not have replenished the token bucket yet, so the second request should fail
 	if lim.Allow() {
 		t.Errorf("Limit(1e-10, 1) want false when already used")
+	}
+}
+
+func TestRevokeFull(t *testing.T) {
+	lim := NewLimiter(10, 2)
+
+	runReserve(t, lim, request{t0, 2, t0, true})
+	r := runReserve(t, lim, request{t0, 2, t2, true})
+	rev := r.RevokeAt(t1)
+	if rev.Status != RevocationFull || rev.Returned != 2 {
+		t.Fatalf("RevokeAt(t1) = %+v, want full revocation of 2 tokens", rev)
+	}
+	if !rev.Revoked() {
+		t.Errorf("Revoked() = false after full revocation")
+	}
+	runReserve(t, lim, request{t1, 2, t2, true})
+}
+
+func TestRevokePartial(t *testing.T) {
+	lim := NewLimiter(10, 4)
+
+	runReserve(t, lim, request{t0, 4, t0, true})
+	rA := runReserve(t, lim, request{t0, 3, t3, true})
+	runReserve(t, lim, request{t0, 1, t4, true})
+	rC := runReserve(t, lim, request{t0, 1, t5, true})
+
+	if got := rC.RevokeAt(t1); got.Status != RevocationFull || got.Returned != 1 {
+		t.Errorf("rC.RevokeAt(t1) = %+v, want full revocation of 1 token", got)
+	}
+	if got := rA.RevokeAt(t1); got.Status != RevocationPartial || got.Returned != 2 {
+		t.Errorf("rA.RevokeAt(t1) = %+v, want partial revocation of 2 tokens", got)
+	}
+	runReserve(t, lim, request{t1, 3, t5, true})
+}
+
+func TestRevokeIdempotent(t *testing.T) {
+	lim := NewLimiter(10, 2)
+
+	runReserve(t, lim, request{t0, 2, t0, true})
+	r := runReserve(t, lim, request{t0, 2, t2, true})
+	if got := r.RevokeAt(t1); got.Status != RevocationFull || got.Returned != 2 {
+		t.Fatalf("first RevokeAt(t1) = %+v, want full revocation of 2 tokens", got)
+	}
+	tokensBefore := lim.tokens
+	if got := r.RevokeAt(t1); got.Status != RevocationRepeated || got.Returned != 0 {
+		t.Errorf("second RevokeAt(t1) = %+v, want repeated revocation", got)
+	}
+	if lim.tokens != tokensBefore {
+		t.Errorf("repeated revocation changed tokens from %v to %v", tokensBefore, lim.tokens)
+	}
+	runReserve(t, lim, request{t1, 2, t2, true})
+}
+
+func TestRevokeStaleGeneration(t *testing.T) {
+	lim := NewLimiter(10, 2)
+
+	runReserve(t, lim, request{t0, 2, t0, true})
+	r := runReserve(t, lim, request{t0, 2, t2, true})
+	gen := r.Generation()
+
+	lim.SetLimitAt(t1, 10)
+	if lim.Generation() == gen {
+		t.Fatalf("generation did not advance after SetLimitAt")
+	}
+	tokensBefore := lim.TokensAt(t1)
+
+	rev := r.RevokeAt(t1)
+	if rev.Status != RevocationStale || rev.Returned != 0 {
+		t.Errorf("RevokeAt(t1) after SetLimitAt = %+v, want stale generation", rev)
+	}
+	if rev.Revoked() {
+		t.Errorf("Revoked() = true for a stale reservation")
+	}
+	if got := lim.TokensAt(t1); got != tokensBefore {
+		t.Errorf("stale revocation changed tokens from %v to %v", tokensBefore, got)
+	}
+}
+
+func TestRevokeExpired(t *testing.T) {
+	lim := NewLimiter(10, 2)
+
+	runReserve(t, lim, request{t0, 2, t0, true})
+	r := runReserve(t, lim, request{t0, 2, t2, true})
+	tokensBefore := lim.TokensAt(t3)
+
+	rev := r.RevokeAt(t3)
+	if rev.Status != RevocationExpired || rev.Returned != 0 {
+		t.Errorf("RevokeAt(t3) = %+v, want expired", rev)
+	}
+	if got := lim.TokensAt(t3); got != tokensBefore {
+		t.Errorf("expired revocation changed tokens from %v to %v", tokensBefore, got)
+	}
+	// The reservation is terminal: a later call is reported as repeated.
+	if got := r.RevokeAt(t1); got.Status != RevocationRepeated {
+		t.Errorf("RevokeAt(t1) after expiry = %+v, want repeated", got)
+	}
+}
+
+func TestRevokeConsumed(t *testing.T) {
+	lim := NewLimiter(10, 2)
+
+	runReserve(t, lim, request{t0, 2, t0, true})
+	r := runReserve(t, lim, request{t0, 1, t1, true})
+	runReserve(t, lim, request{t0, 1, t2, true})
+	tokensBefore := lim.TokensAt(t0)
+
+	rev := r.RevokeAt(t0)
+	if rev.Status != RevocationConsumed || rev.Returned != 0 {
+		t.Errorf("RevokeAt(t0) = %+v, want consumed", rev)
+	}
+	if got := lim.TokensAt(t0); got != tokensBefore {
+		t.Errorf("consumed revocation changed tokens from %v to %v", tokensBefore, got)
+	}
+}
+
+func TestRevokeInvalid(t *testing.T) {
+	lim := NewLimiter(10, 2)
+	r := runReserve(t, lim, request{t0, 3, t0, false})
+	if got := r.RevokeAt(t0); got.Status != RevocationInvalid || got.Returned != 0 {
+		t.Errorf("RevokeAt on invalid reservation = %+v, want invalid", got)
+	}
+}
+
+func TestRevokeInf(t *testing.T) {
+	lim := NewLimiter(Inf, 0)
+	r := lim.ReserveN(t0, 3)
+	if got := r.RevokeAt(t0); got.Status != RevocationFull {
+		t.Errorf("RevokeAt on infinite limiter = %+v, want revoked", got)
+	}
+}
+
+// TestRevokeNoNegativeTokens checks that revocation never refunds a negative
+// number of tokens and never adds debt beyond what other outstanding
+// reservations already owe. A bucket may legitimately hold a negative balance
+// while later reservations remain unfulfilled.
+func TestRevokeNoNegativeTokens(t *testing.T) {
+	lim := NewLimiter(10, 4)
+
+	runReserve(t, lim, request{t0, 4, t0, true})
+	rA := runReserve(t, lim, request{t0, 3, t3, true})
+	runReserve(t, lim, request{t0, 1, t4, true})
+	rC := runReserve(t, lim, request{t0, 1, t5, true})
+
+	// The only outstanding reservation left after both revocations is the
+	// 1-token reservation due at t4, so the bucket must never fall below -1.
+	revC := rC.RevokeAt(t1)
+	revA := rA.RevokeAt(t1)
+	if revC.Returned < 0 || revA.Returned < 0 {
+		t.Fatalf("revocation refunded a negative number of tokens: %+v %+v", revC, revA)
+	}
+	if got := revC.Returned + revA.Returned; got > 1+3 {
+		t.Errorf("total refund = %d, want at most 4", got)
+	}
+	for _, tc := range []struct {
+		t time.Time
+	}{{t0}, {t1}, {t2}, {t3}} {
+		if tokens := lim.TokensAt(tc.t); tokens < -1 {
+			t.Errorf("TokensAt(%v) = %v, want at least -1", tc.t, tokens)
+		}
+	}
+}
+
+func TestCancelAtStaleGeneration(t *testing.T) {
+	lim := NewLimiter(10, 2)
+
+	runReserve(t, lim, request{t0, 2, t0, true})
+	r := runReserve(t, lim, request{t0, 2, t2, true})
+	lim.SetLimitAt(t1, 10)
+	// SetLimitAt advanced the bucket to -1 token at t1 (2 reserved, 1 refilled).
+	if got := lim.TokensAt(t1); got != -1 {
+		t.Fatalf("TokensAt(t1) after SetLimitAt = %v, want -1", got)
+	}
+	// CancelAt mirrors RevokeAt, so it must not touch the reconfigured bucket.
+	r.CancelAt(t1)
+	if got := lim.TokensAt(t1); got != -1 {
+		t.Errorf("TokensAt(t1) after stale CancelAt = %v, want -1", got)
+	}
+}
+
+// TestRevokeZeroBurst verifies that revocation leaves the existing zero-burst
+// semantics alone: only explicit reservations can be revoked, and Allow/Wait
+// keep rejecting events.
+func TestRevokeZeroBurst(t *testing.T) {
+	lim := NewLimiter(10, 0)
+	if lim.Allow() {
+		t.Fatal("Allow() = true with zero burst")
+	}
+	r := lim.ReserveN(t0, 1)
+	if r.OK() {
+		t.Fatal("ReserveN(1) OK with zero burst")
+	}
+	if got := r.RevokeAt(t0); got.Status != RevocationInvalid {
+		t.Errorf("RevokeAt on rejected reservation = %+v, want invalid", got)
+	}
+	zero := lim.ReserveN(t0, 0)
+	if !zero.OK() {
+		t.Fatal("ReserveN(0) not OK with zero burst")
+	}
+	if got := zero.RevokeAt(t0); got.Status != RevocationFull || got.Returned != 0 {
+		t.Errorf("RevokeAt on zero-token reservation = %+v, want full revocation of 0", got)
 	}
 }
